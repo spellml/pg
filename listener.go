@@ -43,6 +43,9 @@ type Listener struct {
 }
 
 func (ln *Listener) String() string {
+	ln.mu.Lock()
+	defer ln.mu.Unlock()
+
 	return fmt.Sprintf("Listener(%s)", strings.Join(ln.channels, ", "))
 }
 
@@ -148,7 +151,9 @@ func (ln *Listener) Close() error {
 // Listen starts listening for notifications on channels.
 func (ln *Listener) Listen(channels ...string) error {
 	// Always append channels so DB.Listen works correctly.
+	ln.mu.Lock()
 	ln.channels = appendIfNotExists(ln.channels, channels...)
+	ln.mu.Unlock()
 
 	cn, err := ln.connWithLock()
 	if err != nil {
@@ -168,6 +173,38 @@ func (ln *Listener) listen(c context.Context, cn *pool.Conn, channels ...string)
 	err := cn.WithWriter(c, ln.db.opt.WriteTimeout, func(wb *pool.WriteBuffer) error {
 		for _, channel := range channels {
 			err := writeQueryMsg(wb, ln.db.fmter, "LISTEN ?", pgChan(channel))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// Unlisten stops listening for notifications on channels.
+func (ln *Listener) Unlisten(channels ...string) error {
+	ln.mu.Lock()
+	ln.channels = removeIfExists(ln.channels, channels...)
+	ln.mu.Unlock()
+
+	cn, err := ln.conn()
+	if err != nil {
+		return err
+	}
+
+	if err := ln.unlisten(context.TODO(), cn, channels...); err != nil {
+		ln.releaseConn(cn, err, false)
+		return err
+	}
+
+	return nil
+}
+
+func (ln *Listener) unlisten(ctx context.Context, cn *pool.Conn, channels ...string) error {
+	err := cn.WithWriter(ctx, ln.db.opt.WriteTimeout, func(wb *pool.WriteBuffer) error {
+		for _, channel := range channels {
+			err := writeQueryMsg(wb, ln.db.fmter, "UNLISTEN ?", pgChan(channel))
 			if err != nil {
 				return err
 			}
@@ -329,6 +366,20 @@ loop:
 			}
 		}
 		ss = append(ss, e)
+	}
+	return ss
+}
+
+func removeIfExists(ss []string, es ...string) []string {
+	for _, e := range es {
+		for i, s := range ss {
+			if s == e {
+				last := len(ss) - 1
+				ss[i] = ss[last]
+				ss = ss[:last]
+				break
+			}
+		}
 	}
 	return ss
 }
